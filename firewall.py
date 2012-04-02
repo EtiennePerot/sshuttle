@@ -70,7 +70,7 @@ def ipt_ttl(*args):
 # multiple copies shouldn't have overlapping subnets, or only the most-
 # recently-started one will win (because we use "-I OUTPUT 1" instead of
 # "-A OUTPUT").
-def do_iptables(port, dnsport, subnets):
+def do_iptables(port, dnsport, udpport, subnets):
     chain = 'sshuttle-%s' % port
 
     # basic cleanup/setup of chains
@@ -86,6 +86,15 @@ def do_iptables(port, dnsport, subnets):
         ipt('-I', 'OUTPUT', '1', '-j', chain)
         ipt('-I', 'PREROUTING', '1', '-j', chain)
 
+    if dnsport:
+        nslist = resolvconf_nameservers()
+        for ip in nslist:
+            ipt_ttl('-A', chain, '-j', 'REDIRECT',
+                    '--dest', '%s/32' % ip,
+                    '-p', 'udp',
+                    '--dport', '53',
+                    '--to-ports', str(dnsport))
+
     if subnets:
         # create new subnet entries.  Note that we're sorting in a very
         # particular order: we need to go from most-specific (largest swidth)
@@ -97,21 +106,47 @@ def do_iptables(port, dnsport, subnets):
                 ipt('-A', chain, '-j', 'RETURN',
                     '--dest', '%s/%s' % (snet,swidth),
                     '-p', 'tcp')
+                if udpport:
+                    ipt('-A', chain, '-j', 'RETURN',
+                        '--dest', '%s/%s' % (snet,swidth),
+                        '-p', 'udp')
             else:
                 ipt_ttl('-A', chain, '-j', 'REDIRECT',
                         '--dest', '%s/%s' % (snet,swidth),
                         '-p', 'tcp',
                         '--to-ports', str(port))
-                
-    if dnsport:
-        nslist = resolvconf_nameservers()
-        for ip in nslist:
-            ipt_ttl('-A', chain, '-j', 'REDIRECT',
-                    '--dest', '%s/32' % ip,
-                    '-p', 'udp',
-                    '--dport', '53',
-                    '--to-ports', str(dnsport))
-
+                if udpport:
+                    ipt_ttl('-A', chain, '-j', 'REDIRECT',
+                            '--dest', '%s/%s' % (snet,swidth),
+                            '-p', 'udp',
+                            '--to-ports', str(udpport))
+    if udpport:
+        log('Establishing UDP sockets...\n')
+        try:
+            # We actually need two sockets; a regular one and a raw one.
+            # See http://stackoverflow.com/q/9969259/109696
+            udpsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udpsock.bind(('127.0.0.1', udpport))
+            rawsock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
+            rawsock.bind(('127.0.0.1', udpport))
+        except socket.error, e:
+            raise Fatal('Could not set up listening UDP sockets! %r\n' % e)
+        try:
+            # Connection back to the client
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.connect(('127.0.0.1', udpport))
+        except socket.error, e:
+            raise Fatal('Could not set up UDP socket back to client! %r\n' % e)
+        def do_wait():
+            while 1:
+                r, w, x = select.select([sys.stdin, udpsock, rawsock], [], [])
+                if udpsock in r:
+                    udpsock.recv(131072) # Don't care about what is received on this one; we only care about the raw socket
+                if rawsock in r:
+                    listener.send(rawsock.recv(131072))
+                if sys.stdin in r:
+                    return
+        return do_wait
 
 def ipfw_rule_exists(n):
     argv = ['ipfw', 'list']
@@ -167,7 +202,7 @@ def _defaults_write_kernel_flags(flags):
     _call(argv)
     argv = ['plutil', '-convert', 'xml1', KERNEL_FLAGS_PATH + '.plist']
     _call(argv)
-    
+
 
 
 def defaults_write_kernel_flag(name, val):
@@ -248,7 +283,6 @@ def _handle_diversion(divertsock, dnsport):
         assert(0)
     newp = _udp_repack(p, src, dst)
     divertsock.sendto(newp, tag)
-    
 
 def ipfw(*args):
     argv = ['ipfw', '-q'] + list(args)
@@ -376,7 +410,7 @@ def do_ipfw(port, dnsport, subnets):
                     return
     else:
         do_wait = None
-        
+
     return do_wait
 
 
@@ -438,11 +472,14 @@ def restore_etc_hosts(port):
 # exit.  In case that fails, it's not the end of the world; future runs will
 # supercede it in the transproxy list, at least, so the leftover rules
 # are hopefully harmless.
-def main(port, dnsport, syslog):
+def main(port, dnsport, udpport, syslog):
     assert(port > 0)
     assert(port <= 65535)
     assert(dnsport >= 0)
     assert(dnsport <= 65535)
+    assert(udpport >= 0)
+    assert(udpport <= 65535)
+    assert(udpport != dnsport)
 
     if os.getuid() != 0:
         raise Fatal('you must be root (or enable su/sudo) to set the firewall')
@@ -497,13 +534,13 @@ def main(port, dnsport, syslog):
         except:
             raise Fatal('firewall: expected route or GO but got %r' % line)
         subnets.append((int(width), bool(int(exclude)), ip))
-        
+
     try:
         if line:
             debug1('firewall manager: starting transproxy.\n')
-            do_wait = do_it(port, dnsport, subnets)
+            do_wait = do_it(port, dnsport, udpport, subnets)
             sys.stdout.write('STARTED\n')
-        
+
         try:
             sys.stdout.flush()
         except IOError:
@@ -530,5 +567,5 @@ def main(port, dnsport, syslog):
             debug1('firewall manager: undoing changes.\n')
         except:
             pass
-        do_it(port, 0, [])
+        do_it(port, 0, 0, [])
         restore_etc_hosts(port)

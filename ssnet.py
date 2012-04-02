@@ -3,7 +3,7 @@ if not globals().get('skip_imports'):
     from helpers import *
 
 MAX_CHANNEL = 65535
-    
+
 # these don't exist in the socket module in python 2.3!
 SHUT_RD = 0
 SHUT_WR = 1
@@ -25,6 +25,8 @@ CMD_HOST_REQ = 0x4208
 CMD_HOST_LIST = 0x4209
 CMD_DNS_REQ = 0x420a
 CMD_DNS_RESPONSE = 0x420b
+CMD_UDP_OUT = 0x420c
+CMD_UDP_IN = 0x420d
 
 cmd_to_name = {
     CMD_EXIT: 'EXIT',
@@ -39,6 +41,8 @@ cmd_to_name = {
     CMD_HOST_LIST: 'HOST_LIST',
     CMD_DNS_REQ: 'DNS_REQ',
     CMD_DNS_RESPONSE: 'DNS_RESPONSE',
+    CMD_UDP_OUT: 'UDP_OUT',
+    CMD_UDP_IN: 'UDP_IN',
 }
 
 
@@ -178,7 +182,7 @@ class SockWrapper:
             debug2('%r: done reading\n' % self)
             self.shut_read = True
             #self.rsock.shutdown(SHUT_RD)  # doesn't do anything anyway
-        
+
     def nowrite(self):
         if not self.shut_write:
             debug2('%r: done writing\n' % self)
@@ -206,7 +210,7 @@ class SockWrapper:
                 # unexpected error... stream is dead
                 self.seterr('uwrite: %s' % e)
                 return 0
-        
+
     def write(self, buf):
         assert(buf)
         return self.uwrite(buf)
@@ -274,7 +278,7 @@ class Proxy(Handler):
     def pre_select(self, r, w, x):
         if self.wrap1.shut_write: self.wrap2.noread()
         if self.wrap2.shut_write: self.wrap1.noread()
-        
+
         if self.wrap1.connect_to:
             _add(w, self.wrap1.rsock)
         elif self.wrap1.buf:
@@ -341,7 +345,7 @@ class Mux(Handler):
         for b in self.outbuf:
             total += len(b)
         return total
-            
+
     def check_fullness(self):
         if self.fullness > 32768:
             if not self.too_full:
@@ -352,7 +356,7 @@ class Mux(Handler):
         #    (s1,s2,c) = struct.unpack('!ccH', b[:4])
         #    ob.append(c)
         #log('outbuf: %d %r\n' % (self.amount_queued(), ob))
-        
+
     def send(self, channel, cmd, data):
         data = str(data)
         assert(len(data) <= 65535)
@@ -364,7 +368,7 @@ class Mux(Handler):
         self.fullness += len(data)
 
     def got_packet(self, channel, cmd, data):
-        debug2('<  channel=%d cmd=%s len=%d\n' 
+        debug2('<  channel=%d cmd=%s len=%d\n'
                % (channel, cmd_to_name.get(cmd,hex(cmd)), len(data)))
         if cmd == CMD_PING:
             self.send(0, CMD_PONG, data)
@@ -400,7 +404,7 @@ class Mux(Handler):
         else:
             callback = self.channels.get(channel)
             if not callback:
-                log('warning: closed channel %d got cmd=%s len=%d\n' 
+                log('warning: closed channel %d got cmd=%s len=%d\n'
                        % (channel, cmd_to_name.get(cmd,hex(cmd)), len(data)))
             else:
                 callback(cmd, data)
@@ -518,7 +522,7 @@ class MuxWrapper(SockWrapper):
         elif cmd == CMD_DATA:
             self.buf.append(data)
         else:
-            raise Exception('unknown command %d (%d bytes)' 
+            raise Exception('unknown command %d (%d bytes)'
                             % (cmd, len(data)))
 
 
@@ -541,11 +545,11 @@ def runonce(handlers, mux):
 
     for s in handlers:
         s.pre_select(r,w,x)
-    debug2('Waiting: %d r=%r w=%r x=%r (fullness=%d/%d)\n' 
+    debug2('Waiting: %d r=%r w=%r x=%r (fullness=%d/%d)\n'
             % (len(handlers), _fds(r), _fds(w), _fds(x),
                mux.fullness, mux.too_full))
     (r,w,x) = select.select(r,w,x)
-    debug2('  Ready: %d r=%r w=%r x=%r\n' 
+    debug2('  Ready: %d r=%r w=%r x=%r\n'
         % (len(handlers), _fds(r), _fds(w), _fds(x)))
     ready = r+w+x
     did = {}

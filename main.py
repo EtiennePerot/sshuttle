@@ -54,6 +54,7 @@ l,listen=  transproxy to this ip address and port number [127.0.0.1:0]
 H,auto-hosts scan for remote hostnames and update local /etc/hosts
 N,auto-nets  automatically determine subnets to route
 dns        capture local DNS requests and forward to the remote DNS server
+u,udp      forward UDP as well
 python=    path to python interpreter on the remote server
 r,remote=  ssh hostname (and optional username) of remote sshuttle server
 x,exclude= exclude this subnet (can be used more than once)
@@ -91,9 +92,9 @@ try:
         server.latency_control = opt.latency_control
         sys.exit(server.main())
     elif opt.firewall:
-        if len(extra) != 2:
-            o.fatal('exactly two arguments expected')
-        sys.exit(firewall.main(int(extra[0]), int(extra[1]), opt.syslog))
+        if len(extra) != 3:
+            o.fatal('exactly three arguments expected')
+        sys.exit(firewall.main(int(extra[0]), int(extra[1]), int(extra[2]), opt.syslog))
     elif opt.hostwatch:
         sys.exit(hostwatch.hw_main(extra))
     else:
@@ -121,6 +122,7 @@ try:
                              opt.python,
                              opt.latency_control,
                              opt.dns,
+                             opt.udp,
                              sh,
                              opt.auto_nets,
                              parse_subnets(includes),

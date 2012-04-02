@@ -40,8 +40,8 @@ def _maskbits(netmask):
         if netmask[0] & _shl(1, i):
             return 32-i
     return 0
-    
-    
+
+
 def _shl(n, bits):
     return n * int(2**bits)
 
@@ -171,7 +171,7 @@ def main():
     debug1('available routes:\n')
     for r in routes:
         debug1('  %s/%d\n' % r)
-        
+
     # synchronization header
     sys.stdout.write('\0\0SSHUTTLE0001')
     sys.stdout.flush()
@@ -189,7 +189,7 @@ def main():
 
     hw = Hostwatch()
     hw.leftover = ''
-        
+
     def hostwatch_ready():
         assert(hw.pid)
         content = hw.sock.recv(4096)
@@ -233,7 +233,7 @@ def main():
             (rpid, rv) = os.waitpid(hw.pid, os.WNOHANG)
             if rpid:
                 raise Fatal('hostwatch exited unexpectedly: code 0x%04x\n' % rv)
-        
+
         ssnet.runonce(handlers, mux)
         if latency_control:
             mux.check_fullness()

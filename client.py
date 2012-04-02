@@ -1,4 +1,4 @@
-import struct, socket, select, errno, re, signal, time
+import struct, socket, select, errno, re, signal, time, threading
 import compat.ssubprocess as ssubprocess
 import helpers, ssnet, ssh, ssyslog
 from ssnet import SockWrapper, Handler, Proxy, Mux, MuxWrapper
@@ -60,7 +60,7 @@ def daemonize():
     # Normal exit when killed, or try/finally won't work and the pidfile won't
     # be deleted.
     signal.signal(signal.SIGTERM, got_signal)
-    
+
     si = open('/dev/null', 'r+')
     os.dup2(si.fileno(), 0)
     os.dup2(si.fileno(), 1)
@@ -96,15 +96,16 @@ def original_dst(sock):
 
 
 class FirewallClient:
-    def __init__(self, port, subnets_include, subnets_exclude, dnsport):
+    def __init__(self, port, subnets_include, subnets_exclude, dnsport, udpport):
         self.port = port
         self.auto_nets = []
         self.subnets_include = subnets_include
         self.subnets_exclude = subnets_exclude
         self.dnsport = dnsport
+        self.udpport = udpport
         argvbase = ([sys.argv[1], sys.argv[0], sys.argv[1]] +
                     ['-v'] * (helpers.verbose or 0) +
-                    ['--firewall', str(port), str(dnsport)])
+                    ['--firewall', str(port), str(dnsport), str(udpport)])
         if ssyslog._p:
             argvbase += ['--syslog']
         argv_tries = [
@@ -235,9 +236,28 @@ def ondns(listener, mux, handlers):
             del dnsreqs[chan]
     debug3('Remaining DNS requests: %d\n' % len(dnsreqs))
 
+class _udpConnectThread(threading.Thread):
+    def __init__(self, udpserver, mux, handlers):
+        threading.Thread.__init__(self)
+        self.udpserver = udpserver
+        self.mux = mux
+        self.handlers = handlers
+    def run(self):
+        print 'Accepting'
+        udplistener, address = self.udpserver.accept()
+        print 'Accepted'
+        self.handlers.append(Handler([udplistener], lambda: onudp(udplistener, self.mux, self.handlers)))
+
+def onudp(listener, mux, handlers):
+    pkt = listener.recv(4096)
+    now = time.time()
+    if pkt:
+        debug1('UDP packet of %d bytes\n' % len(pkt))
+        # TODO: Handle packet
+
 
 def _main(listener, fw, ssh_cmd, remotename, python, latency_control,
-          dnslistener, seed_hosts, auto_nets,
+          dnslistener, udpserver, seed_hosts, auto_nets,
           syslog, daemon):
     handlers = []
     if helpers.verbose >= 1:
@@ -259,7 +279,7 @@ def _main(listener, fw, ssh_cmd, remotename, python, latency_control,
     handlers.append(mux)
 
     expected = 'SSHUTTLE0001'
-    
+
     try:
         v = 'x'
         while v and v != '\0':
@@ -273,11 +293,11 @@ def _main(listener, fw, ssh_cmd, remotename, python, latency_control,
             raise Fatal("failed to establish ssh session (2)")
         else:
             raise
-    
+
     rv = serverproc.poll()
     if rv:
         raise Fatal('server died with error code %d' % rv)
-        
+
     if initstring != expected:
         raise Fatal('expected server init string %r; got %r'
                         % (expected, initstring))
@@ -321,22 +341,23 @@ def _main(listener, fw, ssh_cmd, remotename, python, latency_control,
     if dnslistener:
         handlers.append(Handler([dnslistener], lambda: ondns(dnslistener, mux, handlers)))
 
+    if udpserver:
+        _udpConnectThread(udpserver, mux, handlers).start()
+
     if seed_hosts != None:
         debug1('seed_hosts: %r\n' % seed_hosts)
         mux.send(0, ssnet.CMD_HOST_REQ, '\n'.join(seed_hosts))
-    
+
     while 1:
         rv = serverproc.poll()
         if rv:
             raise Fatal('server died with error code %d' % rv)
-        
         ssnet.runonce(handlers, mux)
         if latency_control:
             mux.check_fullness()
         mux.callback()
 
-
-def main(listenip, ssh_cmd, remotename, python, latency_control, dns,
+def main(listenip, ssh_cmd, remotename, python, latency_control, dns, udp,
          seed_hosts, auto_nets,
          subnets_include, subnets_exclude, syslog, daemon, pidfile):
     if syslog:
@@ -348,7 +369,7 @@ def main(listenip, ssh_cmd, remotename, python, latency_control, dns,
             log("%s\n" % e)
             return 5
     debug1('Starting sshuttle proxy.\n')
-    
+
     if listenip[1]:
         ports = [listenip[1]]
     else:
@@ -369,6 +390,24 @@ def main(listenip, ssh_cmd, remotename, python, latency_control, dns,
             break
         except socket.error, e:
             last_e = e
+    udpserver = None
+    if bound and udp is not None:
+        for port in xrange(15000,12301,-1):
+            if port == listenip[1]:
+                continue
+            udpserver = socket.socket()
+            udpserver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                udpserver.bind((listenip[0], port))
+                udpserver.listen(0)
+                udpport = port
+                debug1('UDP server listening on %r.\n' % (udpport,))
+                break
+            except socket.error, e:
+                bound = False
+                last_e = e
+    else:
+       udpport = 0
     debug2('\n')
     if not bound:
         assert(last_e)
@@ -385,11 +424,11 @@ def main(listenip, ssh_cmd, remotename, python, latency_control, dns,
         dnsport = 0
         dnslistener = None
 
-    fw = FirewallClient(listenip[1], subnets_include, subnets_exclude, dnsport)
-    
+    fw = FirewallClient(listenip[1], subnets_include, subnets_exclude, dnsport, udpport)
+
     try:
         return _main(listener, fw, ssh_cmd, remotename,
-                     python, latency_control, dnslistener,
+                     python, latency_control, dnslistener, udpserver,
                      seed_hosts, auto_nets, syslog, daemon)
     finally:
         try:
