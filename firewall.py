@@ -3,8 +3,11 @@ import compat.ssubprocess as ssubprocess
 import helpers, ssyslog
 from helpers import *
 
-# python doesn't have a definition for this
-IPPROTO_DIVERT = 254
+# python doesn't have a definition for these
+if 'IPPROTO_DIVERT' not in socket.__dict__:
+    socket.IPPROTO_DIVERT = 254
+if 'IP_TRANSPARENT' not in socket.__dict__:
+    socket.IP_TRANSPARENT = 19
 
 # return values from sysctl_set
 SUCCESS = 0
@@ -28,8 +31,8 @@ def _call(argv):
     return rv
 
 
-def ipt_chain_exists(name):
-    argv = ['iptables', '-t', 'nat', '-nL']
+def ipt_chain_exists(name, table='nat'):
+    argv = ['iptables', '-t', table, '-nL']
     p = ssubprocess.Popen(argv, stdout = ssubprocess.PIPE)
     for line in p.stdout:
         if line.startswith('Chain %s ' % name):
@@ -38,9 +41,16 @@ def ipt_chain_exists(name):
     if rv:
         raise Fatal('%r returned %d' % (argv, rv))
 
+def ipr(*args):
+    argv = ['ip'] + list(args)
+    _call(argv)
 
 def ipt(*args):
     argv = ['iptables', '-t', 'nat'] + list(args)
+    _call(argv)
+
+def ipt_mangle(*args):
+    argv = ['iptables', '-t', 'mangle'] + list(args)
     _call(argv)
 
 
@@ -72,6 +82,7 @@ def ipt_ttl(*args):
 # "-A OUTPUT").
 def do_iptables(port, dnsport, udpport, subnets):
     chain = 'sshuttle-%s' % port
+    fwmark = hex(udpport)
 
     # basic cleanup/setup of chains
     if ipt_chain_exists(chain):
@@ -79,12 +90,24 @@ def do_iptables(port, dnsport, udpport, subnets):
         nonfatal(ipt, '-D', 'PREROUTING', '-j', chain)
         nonfatal(ipt, '-F', chain)
         ipt('-X', chain)
+    if udpport and ipt_chain_exists(chain, table='mangle'):
+        nonfatal(ipt_mangle, '-D', 'OUTPUT', '-j', chain)
+        nonfatal(ipt_mangle, '-F', chain)
+        ipt_mangle('-X', chain)
+        nonfatal(ipr, 'rule', 'del', 'fwmark', fwmark, 'lookup', str(udpport))
+        nonfatal(ipr, 'route', 'del', 'local', '0.0.0.0/0', 'dev', 'lo', 'table', str(udpport))
 
     if subnets or dnsport:
         ipt('-N', chain)
         ipt('-F', chain)
         ipt('-I', 'OUTPUT', '1', '-j', chain)
         ipt('-I', 'PREROUTING', '1', '-j', chain)
+        if udpport:
+            ipt_mangle('-N', chain)
+            ipt_mangle('-F', chain)
+            ipt_mangle('-I', 'OUTPUT', '1', '-j', chain)
+            ipr('rule', 'add', 'fwmark', fwmark, 'lookup', str(udpport))
+            ipr('route', 'add', 'local', '0.0.0.0/0', 'dev', 'lo', 'table', str(udpport))
 
     if dnsport:
         nslist = resolvconf_nameservers()
@@ -106,47 +129,43 @@ def do_iptables(port, dnsport, udpport, subnets):
                 ipt('-A', chain, '-j', 'RETURN',
                     '--dest', '%s/%s' % (snet,swidth),
                     '-p', 'tcp')
-                if udpport:
-                    ipt('-A', chain, '-j', 'RETURN',
-                        '--dest', '%s/%s' % (snet,swidth),
-                        '-p', 'udp')
             else:
                 ipt_ttl('-A', chain, '-j', 'REDIRECT',
                         '--dest', '%s/%s' % (snet,swidth),
                         '-p', 'tcp',
                         '--to-ports', str(port))
-                if udpport:
-                    ipt_ttl('-A', chain, '-j', 'REDIRECT',
-                            '--dest', '%s/%s' % (snet,swidth),
-                            '-p', 'udp',
-                            '--to-ports', str(udpport))
-    if udpport:
-        log('Establishing UDP sockets...\n')
-        try:
-            # We actually need two sockets; a regular one and a raw one.
-            # See http://stackoverflow.com/q/9969259/109696
-            udpsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udpsock.bind(('127.0.0.1', udpport))
-            rawsock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
-            rawsock.bind(('127.0.0.1', udpport))
-        except socket.error, e:
-            raise Fatal('Could not set up listening UDP sockets! %r\n' % e)
-        try:
-            # Connection back to the client
-            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            listener.connect(('127.0.0.1', udpport))
-        except socket.error, e:
-            raise Fatal('Could not set up UDP socket back to client! %r\n' % e)
-        def do_wait():
-            while 1:
-                r, w, x = select.select([sys.stdin, udpsock, rawsock], [], [])
-                if udpsock in r:
-                    udpsock.recv(131072) # Don't care about what is received on this one; we only care about the raw socket
-                if rawsock in r:
-                    listener.send(rawsock.recv(131072))
-                if sys.stdin in r:
-                    return
-        return do_wait
+        if udpport:
+            for swidth,sexclude,snet in sorted(subnets, reverse=True):
+                if sexclude:
+                    ipt('-A', chain, '-j', 'RETURN',
+                        '--dest', '%s/%s' % (snet,swidth),
+                        '-p', 'udp')
+                else:
+                    ipt_mangle('-A', chain, '-p', 'udp',
+                               '!', '--dport', '53',
+                               '-j', 'MARK', '--set-mark', fwmark)
+        if udpport:
+            log('Establishing UDP sockets...\n')
+            try:
+                rawsock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
+                rawsock.setsockopt(socket.SOL_IP, socket.IP_TRANSPARENT, 1)
+                rawsock.bind(('', udpport))
+            except socket.error, e:
+                raise Fatal('Could not set up listening UDP sockets! %r\n' % e)
+            try:
+                # Connection back to the client
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listener.connect(('127.0.0.1', udpport))
+            except socket.error, e:
+                raise Fatal('Could not set up UDP socket back to client! %r\n' % e)
+            def do_wait():
+                while True:
+                    r, w, x = select.select([sys.stdin, rawsock], [], [])
+                    if rawsock in r:
+                        listener.send(rawsock.recv(131072))
+                    if sys.stdin in r:
+                        return
+            return do_wait
 
 def ipfw_rule_exists(n):
     argv = ['ipfw', 'list']
@@ -385,7 +404,7 @@ def do_ipfw(port, dnsport, subnets):
     # See?  Easy stuff.
     if dnsport:
         divertsock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
-                                   IPPROTO_DIVERT)
+                                   socket.IPPROTO_DIVERT)
         divertsock.bind(('0.0.0.0', port)) # IP field is ignored
 
         nslist = resolvconf_nameservers()
@@ -567,5 +586,5 @@ def main(port, dnsport, udpport, syslog):
             debug1('firewall manager: undoing changes.\n')
         except:
             pass
-        do_it(port, 0, 0, [])
+        do_it(port, 0, udpport, [])
         restore_etc_hosts(port)

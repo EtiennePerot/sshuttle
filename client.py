@@ -243,18 +243,27 @@ class _udpConnectThread(threading.Thread):
         self.mux = mux
         self.handlers = handlers
     def run(self):
-        print 'Accepting'
         udplistener, address = self.udpserver.accept()
-        print 'Accepted'
         self.handlers.append(Handler([udplistener], lambda: onudp(udplistener, self.mux, self.handlers)))
 
 def onudp(listener, mux, handlers):
-    pkt = listener.recv(4096)
+    ip_header_bytes = listener.recv(20)
     now = time.time()
-    if pkt:
-        debug1('UDP packet of %d bytes\n' % len(pkt))
-        # TODO: Handle packet
-
+    if len(ip_header_bytes) >= 20:
+        ip_header = struct.unpack('!BBHHHBBH4s4s', ip_header_bytes)
+        ip_header_length = (ip_header[0] & 0xF) * 4
+        total_length = ip_header[2]
+        destination = socket.inet_ntoa(ip_header[9])
+        if ip_header_length > 20:
+            listener.recv(ip_header_length - 20) # Skip IP options and stuff
+        udp_packet = listener.recv(total_length - ip_header_length)
+        debug1('UDP packet of %d bytes\n' % len(udp_packet))
+        if len(udp_packet) >= 8:
+            udp_header = struct.unpack('!HHHH', udp_packet[:8])
+            source_port = udp_header[0]
+            destination_port = udp_header[1]
+            udp_content = udp_packet[8:]
+            # TODO: Handle packet
 
 def _main(listener, fw, ssh_cmd, remotename, python, latency_control,
           dnslistener, udpserver, seed_hosts, auto_nets,
@@ -302,7 +311,6 @@ def _main(listener, fw, ssh_cmd, remotename, python, latency_control,
         raise Fatal('expected server init string %r; got %r'
                         % (expected, initstring))
     debug1('connected.\n')
-    print 'Connected.'
     sys.stdout.flush()
     if daemon:
         daemonize()
