@@ -41,7 +41,7 @@ def ipt_chain_exists(name, table='nat'):
     if rv:
         raise Fatal('%r returned %d' % (argv, rv))
 
-def ipr(*args):
+def _ip(*args):
     argv = ['ip'] + list(args)
     _call(argv)
 
@@ -94,8 +94,8 @@ def do_iptables(port, dnsport, udpport, subnets):
         nonfatal(ipt_mangle, '-D', 'OUTPUT', '-j', chain)
         nonfatal(ipt_mangle, '-F', chain)
         ipt_mangle('-X', chain)
-        nonfatal(ipr, 'rule', 'del', 'fwmark', fwmark, 'lookup', str(udpport))
-        nonfatal(ipr, 'route', 'del', 'local', '0.0.0.0/0', 'dev', 'lo', 'table', str(udpport))
+        nonfatal(_ip, 'rule', 'del', 'fwmark', fwmark, 'lookup', str(udpport))
+        nonfatal(_ip, 'route', 'del', 'local', '0.0.0.0/0', 'dev', 'lo', 'table', str(udpport))
 
     if subnets or dnsport:
         ipt('-N', chain)
@@ -106,8 +106,8 @@ def do_iptables(port, dnsport, udpport, subnets):
             ipt_mangle('-N', chain)
             ipt_mangle('-F', chain)
             ipt_mangle('-I', 'OUTPUT', '1', '-j', chain)
-            ipr('rule', 'add', 'fwmark', fwmark, 'lookup', str(udpport))
-            ipr('route', 'add', 'local', '0.0.0.0/0', 'dev', 'lo', 'table', str(udpport))
+            _ip('rule', 'add', 'fwmark', fwmark, 'lookup', str(udpport))
+            _ip('route', 'add', 'local', '0.0.0.0/0', 'dev', 'lo', 'table', str(udpport))
 
     if dnsport:
         nslist = resolvconf_nameservers()
@@ -144,7 +144,6 @@ def do_iptables(port, dnsport, udpport, subnets):
                     ipt_mangle('-A', chain, '-p', 'udp',
                                '!', '--dport', '53',
                                '-j', 'MARK', '--set-mark', fwmark)
-        if udpport:
             log('Establishing UDP sockets...\n')
             try:
                 rawsock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
