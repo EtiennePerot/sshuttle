@@ -61,20 +61,25 @@ def resolvconf_random_nameserver():
         return l[0]
     else:
         return '127.0.0.1'
-    
 
+_local_ip_cache = []
+_nonlocal_ip_cache = []
 def islocal(ip):
+    if ip in _local_ip_cache:
+        return True
+    if ip in _nonlocal_ip_cache:
+        return False
     sock = socket.socket()
     try:
         try:
             sock.bind((ip, 0))
         except socket.error, e:
             if e.args[0] == errno.EADDRNOTAVAIL:
+                _nonlocal_ip_cache.append(ip)
                 return False  # not a local IP
             else:
                 raise
     finally:
         sock.close()
+    _local_ip_cache.append(ip)
     return True  # it's a local IP, or there would have been an error
-
-

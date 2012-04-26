@@ -320,7 +320,7 @@ class Mux(Handler):
         Handler.__init__(self, [rsock, wsock])
         self.rsock = rsock
         self.wsock = wsock
-        self.new_channel = self.got_dns_req = self.got_routes = None
+        self.new_channel = self.got_dns_req = self.got_routes = self.udp_out = self.udp_in = None
         self.got_host_req = self.got_host_list = None
         self.channels = {}
         self.chani = 0
@@ -386,6 +386,9 @@ class Mux(Handler):
             assert(not self.channels.get(channel))
             if self.got_dns_req:
                 self.got_dns_req(channel, data)
+        elif cmd == CMD_UDP_OUT:
+            if self.udp_out:
+                self.udp_out(channel, data)
         elif cmd == CMD_ROUTES:
             if self.got_routes:
                 self.got_routes(data)

@@ -1,6 +1,6 @@
 import re, errno, socket, select, signal, struct
 import compat.ssubprocess as ssubprocess
-import helpers, ssyslog
+import helpers, ssyslog, ipaddr
 from helpers import *
 
 # python doesn't have a definition for these
@@ -15,13 +15,11 @@ SAME = 1
 FAILED = -1
 NONEXIST = -2
 
-
 def nonfatal(func, *args):
     try:
         func(*args)
     except Fatal, e:
         log('error: %s\n' % e)
-
 
 def _call(argv):
     debug1('>> %s\n' % ' '.join(argv))
@@ -30,6 +28,15 @@ def _call(argv):
         raise Fatal('%r returned %d' % (argv, rv))
     return rv
 
+def get_local_ips():
+    ip_process = ssubprocess.Popen(['ip', 'addr', 'show'], stdout=ssubprocess.PIPE)
+    match_ip = re.compile(r'^\s*inet:?\s+([.\d]+)')
+    local_ips = []
+    for line in ip_process.stdout:
+        res = match_ip.search(line)
+        if res:
+            local_ips.append(res.group(1))
+    return local_ips
 
 def ipt_chain_exists(name, table='nat'):
     argv = ['iptables', '-t', table, '-nL']
@@ -73,7 +80,20 @@ def ipt_ttl(*args):
     else:
         ipt(*args)
 
-
+udp_replay_sockets = {} # Dictionary mapping tuples (remote, remote_port) to lists [sock, timeout]
+def replay_udp(sock):
+    udp_length, source, source_port, remote, remote_port = struct.unpack('!H4sH4sH', sock.recv(14))
+    udp_data = sock.recv(udp_length)
+    replay_key = remote, remote_port
+    if replay_key not in udp_replay_sockets:
+        boundSock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        boundSock.setsockopt(socket.SOL_IP, socket.IP_TRANSPARENT, 1)
+        boundSock.bind((socket.inet_ntoa(remote), remote_port))
+        udp_replay_sockets[replay_key] = [boundSock, 0]
+    try:
+        udp_replay_sockets[replay_key][0].sendto(udp_data, (socket.inet_ntoa(source), source_port))
+    except socket.error:
+        pass
 
 # We name the chain based on the transproxy port number so that it's possible
 # to run multiple copies of sshuttle at the same time.  Of course, the
@@ -135,13 +155,24 @@ def do_iptables(port, dnsport, udpport, subnets):
                         '-p', 'tcp',
                         '--to-ports', str(port))
         if udpport:
+            for local_ip in get_local_ips():
+                excluded = False
+                ip_address = ipaddr.IPAddress(local_ip)
+                for swidth,sexclude,snet in subnets:
+                    if sexclude and ip_address in ipaddr.IPNetwork('%s/%s' % (snet,swidth)):
+                        excluded = True
+                if not excluded:
+                    ipt_mangle('-A', chain, '-j', 'RETURN',
+                               '--dest', '%s/32' % local_ip,
+                               '-p', 'udp')
             for swidth,sexclude,snet in sorted(subnets, reverse=True):
                 if sexclude:
-                    ipt('-A', chain, '-j', 'RETURN',
-                        '--dest', '%s/%s' % (snet,swidth),
-                        '-p', 'udp')
+                    ipt_mangle('-A', chain, '-j', 'RETURN',
+                               '--dest', '%s/%s' % (snet,swidth),
+                               '-p', 'udp')
                 else:
                     ipt_mangle('-A', chain, '-p', 'udp',
+                               '--dest', '%s/%s' % (snet,swidth),
                                '!', '--dport', '53',
                                '-j', 'MARK', '--set-mark', fwmark)
             log('Establishing UDP sockets...\n')
@@ -153,15 +184,17 @@ def do_iptables(port, dnsport, udpport, subnets):
                 raise Fatal('Could not set up listening UDP sockets! %r\n' % e)
             try:
                 # Connection back to the client
-                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                listener.connect(('127.0.0.1', udpport))
+                clientudp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                clientudp.connect(('127.0.0.1', udpport))
             except socket.error, e:
                 raise Fatal('Could not set up UDP socket back to client! %r\n' % e)
             def do_wait():
                 while True:
-                    r, w, x = select.select([sys.stdin, rawsock], [], [])
+                    r, w, x = select.select([sys.stdin, rawsock, clientudp], [], [])
                     if rawsock in r:
-                        listener.send(rawsock.recv(131072))
+                        clientudp.send(rawsock.recv(131072))
+                    if clientudp in r:
+                        replay_udp(clientudp)
                     if sys.stdin in r:
                         return
             return do_wait
@@ -182,7 +215,6 @@ def ipfw_rule_exists(n):
     if rv:
         raise Fatal('%r returned %d' % (argv, rv))
     return found
-
 
 _oldctls = {}
 def _fill_oldctls(prefix):
@@ -580,6 +612,12 @@ def main(port, dnsport, udpport, syslog):
                 raise Fatal('expected EOF, got %r' % line)
             else:
                 break
+    except KeyboardInterrupt:
+        # Silently ignore; otherwise, the exception will be queued up and the
+        # firewall process will exit with return code 1.
+        # sshuttle is still stoppable using the keyboard interrupt, it just
+        # won't complain about the firewall exitting badly when it does so.
+        pass
     finally:
         try:
             debug1('firewall manager: undoing changes.\n')

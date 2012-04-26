@@ -236,34 +236,54 @@ def ondns(listener, mux, handlers):
             del dnsreqs[chan]
     debug3('Remaining DNS requests: %d\n' % len(dnsreqs))
 
-class _udpConnectThread(threading.Thread):
+class udp_thread(threading.Thread):
+    udp_channel_timeout = 600
+    ip_packet_format = '!BBHHHBBH4s4s'
     def __init__(self, udpserver, mux, handlers):
         threading.Thread.__init__(self)
         self.udpserver = udpserver
         self.mux = mux
         self.handlers = handlers
+        self.channels = {} # Dictionary mapping tuples (source_port, destination, destination_port) to lists [source, channel, timeout]
     def run(self):
-        udplistener, address = self.udpserver.accept()
-        self.handlers.append(Handler([udplistener], lambda: onudp(udplistener, self.mux, self.handlers)))
-
-def onudp(listener, mux, handlers):
-    ip_header_bytes = listener.recv(20)
-    now = time.time()
-    if len(ip_header_bytes) >= 20:
-        ip_header = struct.unpack('!BBHHHBBH4s4s', ip_header_bytes)
-        ip_header_length = (ip_header[0] & 0xF) * 4
-        total_length = ip_header[2]
-        destination = socket.inet_ntoa(ip_header[9])
-        if ip_header_length > 20:
-            listener.recv(ip_header_length - 20) # Skip IP options and stuff
-        udp_packet = listener.recv(total_length - ip_header_length)
-        debug1('UDP packet of %d bytes\n' % len(udp_packet))
-        if len(udp_packet) >= 8:
-            udp_header = struct.unpack('!HHHH', udp_packet[:8])
-            source_port = udp_header[0]
-            destination_port = udp_header[1]
-            udp_content = udp_packet[8:]
-            # TODO: Handle packet
+        self.udplistener, self.address = self.udpserver.accept()
+        self.handlers.append(Handler([self.udplistener], self.onudp))
+    def onudp(self):
+        ip_header_bytes = self.udplistener.recv(20)
+        if len(ip_header_bytes) >= 20:
+            ip_header = struct.unpack(udp_thread.ip_packet_format, ip_header_bytes)
+            ip_header_length = (ip_header[0] & 0xF) * 4
+            total_length = ip_header[2]
+            source = ip_header[8]
+            destination = ip_header[9]
+            if ip_header_length > 20:
+                self.udplistener.recv(ip_header_length - 20) # Skip IP options and stuff
+            udp_packet = self.udplistener.recv(total_length - ip_header_length)
+            if not helpers.islocal(socket.inet_ntoa(source)):
+                return
+            if len(udp_packet) >= 8:
+                udp_header = struct.unpack('!HHHH', udp_packet[:8])
+                source_port = udp_header[0]
+                destination_port = udp_header[1]
+                udp_content = udp_packet[8:]
+                debug2('UDP packet to %s:%d of %d bytes\n' % (socket.inet_ntoa(destination), destination_port, len(udp_packet)))
+                key = source_port, destination, destination_port
+                if key not in self.channels:
+                    chan = self.mux.next_channel()
+                    self.channels[key] = [source, chan, time.time() + udp_thread.udp_channel_timeout]
+                else:
+                    chan = self.channels[key][1]
+                    self.channels[key][2] = time.time() + udp_thread.udp_channel_timeout
+                self.mux.send(chan, ssnet.CMD_UDP_OUT, struct.pack('!H4sH', source_port, destination, destination_port) + udp_content)
+                self.mux.channels[chan] = self.onudpback
+    def onudpback(self, chan, data):
+        key = struct.unpack('!H4sH', data[:8])
+        if key in self.channels:
+            remote, remote_port = struct.unpack('!4sH', data[8:14])
+            udp_content = data[14:]
+            miniheader = struct.pack('!H4sH4sH', len(udp_content), self.channels[key][0], key[0], remote, remote_port)
+            self.channels[key][2] = time.time() + udp_thread.udp_channel_timeout # Update timeout
+            self.udplistener.send(miniheader + udp_content)
 
 def _main(listener, fw, ssh_cmd, remotename, python, latency_control,
           dnslistener, udpserver, seed_hosts, auto_nets,
@@ -350,7 +370,7 @@ def _main(listener, fw, ssh_cmd, remotename, python, latency_control,
         handlers.append(Handler([dnslistener], lambda: ondns(dnslistener, mux, handlers)))
 
     if udpserver:
-        _udpConnectThread(udpserver, mux, handlers).start()
+        udp_thread(udpserver, mux, handlers).start()
 
     if seed_hosts != None:
         debug1('seed_hosts: %r\n' % seed_hosts)
@@ -409,7 +429,7 @@ def main(listenip, ssh_cmd, remotename, python, latency_control, dns, udp,
                 udpserver.bind((listenip[0], port))
                 udpserver.listen(0)
                 udpport = port
-                debug1('UDP server listening on %r.\n' % (udpport,))
+                debug2('UDP server listening on %r.\n' % (udpport,))
                 break
             except socket.error, e:
                 bound = False
