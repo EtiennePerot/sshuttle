@@ -1,4 +1,4 @@
-import re, errno, socket, select, signal, struct
+import re, errno, socket, select, signal, struct, time
 import compat.ssubprocess as ssubprocess
 import helpers, ssyslog, ipaddr
 from helpers import *
@@ -28,15 +28,22 @@ def _call(argv):
         raise Fatal('%r returned %d' % (argv, rv))
     return rv
 
+_local_ips = []
 def get_local_ips():
-    ip_process = ssubprocess.Popen(['ip', 'addr', 'show'], stdout=ssubprocess.PIPE)
-    match_ip = re.compile(r'^\s*inet:?\s+([.\d]+)')
-    local_ips = []
-    for line in ip_process.stdout:
-        res = match_ip.search(line)
-        if res:
-            local_ips.append(res.group(1))
-    return local_ips
+    if not _local_ips:
+        ip_process = ssubprocess.Popen(['ip', 'addr', 'show'], stdout=ssubprocess.PIPE)
+        match_ip = re.compile(r'^\s*inet:?\s+([.\d]+)')
+        for line in ip_process.stdout:
+            res = match_ip.search(line)
+            if res:
+                _local_ips.append(res.group(1))
+    return _local_ips
+
+def get_external_ip():
+    for i in get_local_ips():
+        if i.split('.')[0] != '127':
+            return i
+    return '127.0.0.1'
 
 def ipt_chain_exists(name, table='nat'):
     argv = ['iptables', '-t', table, '-nL']
@@ -81,6 +88,7 @@ def ipt_ttl(*args):
         ipt(*args)
 
 udp_replay_sockets = {} # Dictionary mapping tuples (remote, remote_port) to lists [sock, timeout]
+udp_replay_timeout = 5
 def replay_udp(sock):
     udp_length, source, source_port, remote, remote_port = struct.unpack('!H4sH4sH', sock.recv(14))
     udp_data = sock.recv(udp_length)
@@ -90,10 +98,23 @@ def replay_udp(sock):
         boundSock.setsockopt(socket.SOL_IP, socket.IP_TRANSPARENT, 1)
         boundSock.bind((socket.inet_ntoa(remote), remote_port))
         udp_replay_sockets[replay_key] = [boundSock, 0]
+    if source == '\x00\x00\x00\x00':
+        source = get_external_ip()
+    else:
+        source = socket.inet_ntoa(source)
+    now = time.time()
     try:
-        udp_replay_sockets[replay_key][0].sendto(udp_data, (socket.inet_ntoa(source), source_port))
+        udp_replay_sockets[replay_key][0].sendto(udp_data, (source, source_port))
+        udp_replay_sockets[replay_key][1] = now + udp_replay_timeout
     except socket.error:
         pass
+    for r, s in udp_replay_sockets.items():
+        if s[1] < now:
+            try:
+                s[0].close()
+            except:
+                pass
+            del udp_replay_sockets[r]
 
 # We name the chain based on the transproxy port number so that it's possible
 # to run multiple copies of sshuttle at the same time.  Of course, the

@@ -239,17 +239,41 @@ def ondns(listener, mux, handlers):
 class udp_thread(threading.Thread):
     udp_channel_timeout = 600
     ip_packet_format = '!BBHHHBBH4s4s'
-    def __init__(self, udpserver, mux, handlers):
+    def __init__(self, udp_server, udp_forward, mux, handlers):
         threading.Thread.__init__(self)
-        self.udpserver = udpserver
+        self.udp_server = udp_server
+        self.udp_forward = udp_forward
         self.mux = mux
         self.handlers = handlers
         self.channels = {} # Dictionary mapping tuples (source_port, destination, destination_port) to lists [source, channel, timeout]
+        self.forward_channel = None
     def run(self):
-        self.udplistener, self.address = self.udpserver.accept()
-        self.handlers.append(Handler([self.udplistener], self.onudp))
+        self.udp_listener, self.address = self.udp_server.accept()
+        self.handlers.append(Handler([self.udp_listener], self.onudp))
+        if self.udp_forward:
+            self.forward_channel = self.mux.next_channel()
+            self.mux.channels[self.forward_channel] = self.onudpback
+            for p in self.udp_forward:
+                self.mux.send(self.forward_channel, ssnet.CMD_UDP_FWD, struct.pack('!H', p))
+    def tick(self):
+        now = time.time()
+        for c, v in self.channels.items():
+            if v[2] < now:
+                del self.mux.channels[v[1]]
+                del self.channels[c]
+    def openchannel(self, source, source_port, destination, destination_port):
+        key = source_port, destination, destination_port
+        if key not in self.channels:
+            chan = self.mux.next_channel()
+            self.channels[key] = [source, chan, time.time() + udp_thread.udp_channel_timeout]
+            self.mux.channels[chan] = self.onudpback
+        else:
+            chan = self.channels[key][1]
+            self.channels[key][2] = time.time() + udp_thread.udp_channel_timeout
+        return chan
     def onudp(self):
-        ip_header_bytes = self.udplistener.recv(20)
+        self.tick()
+        ip_header_bytes = self.udp_listener.recv(20)
         if len(ip_header_bytes) >= 20:
             ip_header = struct.unpack(udp_thread.ip_packet_format, ip_header_bytes)
             ip_header_length = (ip_header[0] & 0xF) * 4
@@ -257,8 +281,8 @@ class udp_thread(threading.Thread):
             source = ip_header[8]
             destination = ip_header[9]
             if ip_header_length > 20:
-                self.udplistener.recv(ip_header_length - 20) # Skip IP options and stuff
-            udp_packet = self.udplistener.recv(total_length - ip_header_length)
+                self.udp_listener.recv(ip_header_length - 20) # Skip IP options and stuff
+            udp_packet = self.udp_listener.recv(total_length - ip_header_length)
             if not helpers.islocal(socket.inet_ntoa(source)):
                 return
             if len(udp_packet) >= 8:
@@ -267,26 +291,23 @@ class udp_thread(threading.Thread):
                 destination_port = udp_header[1]
                 udp_content = udp_packet[8:]
                 debug2('UDP packet to %s:%d of %d bytes\n' % (socket.inet_ntoa(destination), destination_port, len(udp_packet)))
-                key = source_port, destination, destination_port
-                if key not in self.channels:
-                    chan = self.mux.next_channel()
-                    self.channels[key] = [source, chan, time.time() + udp_thread.udp_channel_timeout]
-                else:
-                    chan = self.channels[key][1]
-                    self.channels[key][2] = time.time() + udp_thread.udp_channel_timeout
+                chan = self.openchannel(source, source_port, destination, destination_port)
                 self.mux.send(chan, ssnet.CMD_UDP_OUT, struct.pack('!H4sH', source_port, destination, destination_port) + udp_content)
-                self.mux.channels[chan] = self.onudpback
     def onudpback(self, chan, data):
+        self.tick()
         key = struct.unpack('!H4sH', data[:8])
         if key in self.channels:
-            remote, remote_port = struct.unpack('!4sH', data[8:14])
-            udp_content = data[14:]
-            miniheader = struct.pack('!H4sH4sH', len(udp_content), self.channels[key][0], key[0], remote, remote_port)
             self.channels[key][2] = time.time() + udp_thread.udp_channel_timeout # Update timeout
-            self.udplistener.send(miniheader + udp_content)
+            source = self.channels[key][0]
+        else:
+            source = '\x00\x00\x00\x00' # Unknown source
+        remote, remote_port = struct.unpack('!4sH', data[8:14])
+        udp_content = data[14:]
+        miniheader = struct.pack('!H4sH4sH', len(udp_content), source, key[0], remote, remote_port)
+        self.udp_listener.send(miniheader + udp_content)
 
 def _main(listener, fw, ssh_cmd, remotename, python, latency_control,
-          dnslistener, udpserver, seed_hosts, auto_nets,
+          dnslistener, udp_server, udp_forward, seed_hosts, auto_nets,
           syslog, daemon):
     handlers = []
     if helpers.verbose >= 1:
@@ -369,8 +390,8 @@ def _main(listener, fw, ssh_cmd, remotename, python, latency_control,
     if dnslistener:
         handlers.append(Handler([dnslistener], lambda: ondns(dnslistener, mux, handlers)))
 
-    if udpserver:
-        udp_thread(udpserver, mux, handlers).start()
+    if udp_server:
+        udp_thread(udp_server, udp_forward, mux, handlers).start()
 
     if seed_hosts != None:
         debug1('seed_hosts: %r\n' % seed_hosts)
@@ -385,7 +406,7 @@ def _main(listener, fw, ssh_cmd, remotename, python, latency_control,
             mux.check_fullness()
         mux.callback()
 
-def main(listenip, ssh_cmd, remotename, python, latency_control, dns, udp,
+def main(listenip, ssh_cmd, remotename, python, latency_control, dns, udp, udp_forward,
          seed_hosts, auto_nets,
          subnets_include, subnets_exclude, syslog, daemon, pidfile):
     if syslog:
@@ -418,16 +439,16 @@ def main(listenip, ssh_cmd, remotename, python, latency_control, dns, udp,
             break
         except socket.error, e:
             last_e = e
-    udpserver = None
+    udp_server = None
     if bound and udp is not None:
         for port in xrange(15000,12301,-1):
             if port == listenip[1]:
                 continue
-            udpserver = socket.socket()
-            udpserver.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            udp_server = socket.socket()
+            udp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                udpserver.bind((listenip[0], port))
-                udpserver.listen(0)
+                udp_server.bind((listenip[0], port))
+                udp_server.listen(0)
                 udpport = port
                 debug2('UDP server listening on %r.\n' % (udpport,))
                 break
@@ -456,7 +477,7 @@ def main(listenip, ssh_cmd, remotename, python, latency_control, dns, udp,
 
     try:
         return _main(listener, fw, ssh_cmd, remotename,
-                     python, latency_control, dnslistener, udpserver,
+                     python, latency_control, dnslistener, udp_server, udp_forward,
                      seed_hosts, auto_nets, syslog, daemon)
     finally:
         try:

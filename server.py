@@ -159,15 +159,11 @@ class DnsProxy(Handler):
         self.mux.send(self.chan, ssnet.CMD_DNS_RESPONSE, data)
         self.ok = False
 
-class udp_channel(Handler):
-    udp_channel_timeout = 600
-    def __init__(self, mux, chan, source_port, destination, destination_port):
-        self.original_key = struct.pack('!H4sH', source_port, destination, destination_port)
+_udp_sockets = {} # Maps port numbers to udp_socket instances
+class udp_socket(Handler):
+    def __init__(self, mux, chan, source_port, forwarding=False):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         Handler.__init__(self, [self.sock])
-        self.mux = mux
-        self.chan = chan
-        self.timeout = time.time() + udp_channel.udp_channel_timeout
         try:
             self.sock.bind(('', source_port))
         except socket.error:
@@ -177,22 +173,67 @@ class udp_channel(Handler):
                 except:
                     pass
         self.source_port = source_port
-        self.destination = socket.inet_ntoa(destination)
-        self.destination_port = destination_port
-        self.sock.connect((self.destination, self.destination_port))
-        debug1('UDP channel opened from port %d to %s: %d\n' % (self.source_port, self.destination, self.destination_port))
-    def send(self, data):
-        try:
-            self.sock.send(data)
-        except socket.error:
-            self.ok = False
+        _udp_sockets[self.source_port] = self
+        self.channels = {}
+        self.mux = mux
+        self.chan = chan
+        self.forwarding = forwarding
+        self.default_key = struct.pack('!H4sH', self.source_port, '\x00\x00\x00\x00', 0)
+        debug1('UDP socket listening on port %d\n' % self.source_port)
+    def addchannel(self, channel, key):
+        self.channels[key] = channel
+    def removechannel(self, key):
+        del self.channels[key]
+        if not self.channels:
+            self.close()
+    def sendto(self, data, destination):
+        self.sock.sendto(data, destination)
     def callback(self):
         try:
             data, source = self.sock.recvfrom(131072)
+            if source in self.channels:
+                self.channels[source].callback(source, data)
+            else:
+                self.mux.send(self.chan, ssnet.CMD_UDP_IN, self.default_key + struct.pack('!4sH', socket.inet_aton(source[0]), source[1]) + data)
+        except socket.error:
+            self.close()
+    def close(self):
+        if not self.forwarding:
+            self.ok = False
+            try:
+                self.sock.close()
+            except:
+                pass
+
+class udp_channel:
+    udp_channel_timeout = 600
+    def __init__(self, mux, chan, handlers, source_port, destination, destination_port):
+        self.original_key = struct.pack('!H4sH', source_port, destination, destination_port)
+        self.timeout = time.time() + udp_channel.udp_channel_timeout
+        self.source_port = source_port
+        self.destination = socket.inet_ntoa(destination)
+        self.destination_port = destination_port
+        if self.source_port not in _udp_sockets:
+            handlers.append(udp_socket(mux, chan, self.source_port))
+        self.socket = _udp_sockets[self.source_port]
+        self.socket.addchannel(self, (self.destination, self.destination_port))
+        self.mux = mux
+        self.chan = chan
+        self.ok = True
+        debug1('UDP channel opened from port %d to %s: %d\n' % (self.source_port, self.destination, self.destination_port))
+    def send(self, data):
+        try:
+            self.socket.sendto(data, (self.destination, self.destination_port))
+        except socket.error:
+            self.close()
+    def callback(self, source, data):
+        try:
             self.mux.send(self.chan, ssnet.CMD_UDP_IN, self.original_key + struct.pack('!4sH', socket.inet_aton(source[0]), source[1]) + data)
         except socket.error:
-            self.ok = False
+            self.close()
     def close(self):
+        self.ok = False
+        self.socket.removechannel(self)
         try:
             self.sock.close()
         except:
@@ -271,11 +312,13 @@ def main():
         udp_content = data[8:]
         if key not in udphandlers:
             debug2('Opening UDP channel.\n')
-            u = udp_channel(mux, channel, key[0], key[1], key[2])
+            u = udp_channel(mux, channel, handlers, key[0], key[1], key[2])
             udphandlers[key] = u
-            handlers.append(u)
         udphandlers[key].send(udp_content)
+    def udp_fwd(channel, data):
+        handlers.append(udp_socket(mux, channel, struct.unpack('!H', data)[0], forwarding=True))
     mux.udp_out = udp_req
+    mux.udp_fwd = udp_fwd
 
     while mux.ok:
         if hw.pid:
@@ -301,4 +344,4 @@ def main():
             for key,u in udphandlers.items():
                 if u.timeout < now or not u.ok:
                     del udphandlers[key]
-                    u.ok = False
+                    u.close()

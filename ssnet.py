@@ -27,6 +27,7 @@ CMD_DNS_REQ = 0x420a
 CMD_DNS_RESPONSE = 0x420b
 CMD_UDP_OUT = 0x420c
 CMD_UDP_IN = 0x420d
+CMD_UDP_FWD = 0x420e
 
 cmd_to_name = {
     CMD_EXIT: 'EXIT',
@@ -43,6 +44,7 @@ cmd_to_name = {
     CMD_DNS_RESPONSE: 'DNS_RESPONSE',
     CMD_UDP_OUT: 'UDP_OUT',
     CMD_UDP_IN: 'UDP_IN',
+    CMD_UDP_FWD: 'UDP_FWD'
 }
 
 
@@ -320,7 +322,7 @@ class Mux(Handler):
         Handler.__init__(self, [rsock, wsock])
         self.rsock = rsock
         self.wsock = wsock
-        self.new_channel = self.got_dns_req = self.got_routes = self.udp_out = self.udp_in = None
+        self.new_channel = self.got_dns_req = self.got_routes = self.udp_out = self.udp_in = self.udp_fwd = None
         self.got_host_req = self.got_host_list = None
         self.channels = {}
         self.chani = 0
@@ -389,6 +391,9 @@ class Mux(Handler):
         elif cmd == CMD_UDP_OUT:
             if self.udp_out:
                 self.udp_out(channel, data)
+        elif cmd == CMD_UDP_FWD:
+            if self.udp_fwd:
+                self.udp_fwd(channel, data)
         elif cmd == CMD_ROUTES:
             if self.got_routes:
                 self.got_routes(data)

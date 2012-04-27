@@ -50,26 +50,27 @@ sshuttle --server
 sshuttle --firewall <port> <subnets...>
 sshuttle --hostwatch
 --
-l,listen=  transproxy to this ip address and port number [127.0.0.1:0]
-H,auto-hosts scan for remote hostnames and update local /etc/hosts
-N,auto-nets  automatically determine subnets to route
-dns        capture local DNS requests and forward to the remote DNS server
-u,udp      forward UDP as well
-python=    path to python interpreter on the remote server
-r,remote=  ssh hostname (and optional username) of remote sshuttle server
-x,exclude= exclude this subnet (can be used more than once)
-v,verbose  increase debug message verbosity
-e,ssh-cmd= the command to use to connect to the remote [ssh]
-seed-hosts= with -H, use these hostnames for initial scan (comma-separated)
-no-latency-control  sacrifice latency to improve bandwidth benchmarks
-wrap=      restart counting channel numbers after this number (for testing)
-D,daemon   run in the background as a daemon
-V,version  print sshuttle's version number
-syslog     send log messages to syslog (default if you use --daemon)
-pidfile=   pidfile name (only if using --daemon) [./sshuttle.pid]
-server     (internal use only)
-firewall   (internal use only)
-hostwatch  (internal use only)
+l,listen=          transproxy to this ip address and port number [127.0.0.1:0]
+H,auto-hosts       scan for remote hostnames and update local /etc/hosts
+N,auto-nets        automatically determine subnets to route
+dns                capture local DNS requests and forward to the remote DNS server
+u,udp              forward UDP as well
+udp-forward=       Comma-separated list of UDP ports or port ranges to forward back to this machine
+python=            path to python interpreter on the remote server
+r,remote=          ssh hostname (and optional username) of remote sshuttle server
+x,exclude=         exclude this subnet (can be used more than once)
+v,verbose          increase debug message verbosity
+e,ssh-cmd=         the command to use to connect to the remote [ssh]
+seed-hosts=        with -H, use these hostnames for initial scan (comma-separated)
+no-latency-control sacrifice latency to improve bandwidth benchmarks
+wrap=              restart counting channel numbers after this number (for testing)
+D,daemon           run in the background as a daemon
+V,version          print sshuttle's version number
+syslog             send log messages to syslog (default if you use --daemon)
+pidfile=           pidfile name (only if using --daemon) [./sshuttle.pid]
+server             (internal use only)
+firewall           (internal use only)
+hostwatch          (internal use only)
 """
 o = options.Options(optspec)
 (opt, flags, extra) = o.parse(sys.argv[2:])
@@ -116,6 +117,26 @@ try:
             sh = []
         else:
             sh = None
+        udp_forward = []
+        if opt.udp_forward:
+            opt.udp = True # Implicitly turn on
+            for p in str(opt.udp_forward).split(','):
+                if '-' in p:
+                    try:
+                        range_start, range_end = map(int, p.split('-', 2))
+                        if range_start <= 0 or range_start >= 65535 or range_end <= 0 or range_end >= 65535:
+                            o.fatal('UDP port values not in acceptable range: ' + p)
+                        udp_forward += range(range_start, range_end)
+                    except ValueError:
+                        o.fatal('invalid UDP port range: ' + p)
+                else:
+                    try:
+                        port = int(p)
+                        if port <= 0 or port >= 65535:
+                            o.fatal('UDP port value not in acceptable range: ' + p)
+                        udp_forward.append(port)
+                    except ValueError:
+                        o.fatal('invalid port number: ' + p)
         sys.exit(client.main(parse_ipport(opt.listen or '0.0.0.0:0'),
                              opt.ssh_cmd,
                              remotename,
@@ -123,6 +144,7 @@ try:
                              opt.latency_control,
                              opt.dns,
                              opt.udp,
+                             udp_forward,
                              sh,
                              opt.auto_nets,
                              parse_subnets(includes),
